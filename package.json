@@ -1,0 +1,32 @@
+{
+  "name": "@pipeworx/mcp-stats-nz",
+  "version": "0.1.0",
+  "description": "New Zealand official statistics (Aotearoa Data Explorer) — search Stats NZ's 911 published datasets by keyword and pull their observations, covering the 2013/2018/2023 censuses, earnings, business demography, population projections, household expenditure and justice statistics.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "mcp-stats-nz": "bin/cli.js"
+  },
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "stats-nz"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipeworx-io/mcp-stats-nz.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-1a5a9527ad48c3d3f61481d8d1912658491b055a211505f6b4133ed1672e7360",
+    "sourceCommit": "b0fb3c31386cf0256dcf1e2f1b3440435a87ec35"
+  }
+}

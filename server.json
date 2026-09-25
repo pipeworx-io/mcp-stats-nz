@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pipeworx-io/stats-nz",
+  "title": "Stats Nz",
+  "description": "New Zealand official statistics (Aotearoa Data Explorer) — search Stats NZ's 911 published…",
+  "version": "0.1.0",
+  "websiteUrl": "https://pipeworx.io/packs/stats-nz",
+  "repository": {
+    "url": "https://github.com/pipeworx-io/mcp-stats-nz",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://gateway.pipeworx.io/stats-nz/mcp"
+    }
+  ]
+}
