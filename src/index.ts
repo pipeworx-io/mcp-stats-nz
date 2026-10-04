@@ -828,6 +828,12 @@ async function sdmxFetch(path: string, accept: string, apiKey?: string): Promise
   if (res.status === 406) {
     throw new Error(`Stats NZ refused the Accept header for /${path} (HTTP 406). Their server advertises which media types it will serve; this pack asks for JSON where JSON is served and parses SDMX-ML where it is not.`);
   }
+  if (res.status >= 500) {
+    // Their failure, not ours: 2026-10-04 four Meta-agent calls got HTTP 500
+    // from api.data.stats.govt.nz and booked as OUR `error` class, which put
+    // statsnz_observations on the problem-tools list for a vendor outage.
+    throw new Error(`upstream_down: Stats NZ answered HTTP ${res.status} for /${path}. ${summarizeErrorBody(await res.text())} Retry shortly; the dataset and path are fine.`);
+  }
   if (!res.ok) throw new Error(`Stats NZ request failed: HTTP ${res.status} ${summarizeErrorBody(await res.text())}`);
   return res;
 }
