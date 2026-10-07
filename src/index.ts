@@ -838,9 +838,60 @@ async function sdmxFetch(path: string, accept: string, apiKey?: string): Promise
   return res;
 }
 
-async function sdmxGetJson(path: string, accept: string, apiKey?: string): Promise<unknown> {
+/**
+ * Hard ceiling on a single upstream response body for this pack.
+ *
+ * Measured 2026-10-07 (fleet #2786): the default "all" query on a wide
+ * census cross-tab (e.g. CEN23_HAD_020 — year x small-area geography x
+ * smoking status x ethnicity x age x gender, with NO time dimension for
+ * `lastNObservations` to shrink) returns ~65MB of SDMX-JSON with no
+ * Content-Length header at all (verified live: `curl -D -` shows none,
+ * chunked through Cloudflare). Buffering that into a JS string inside a
+ * 128MB Workers isolate either throws "Memory limit exceeded before EOF"
+ * mid-read or blows the 25s fetch timeout waiting for the rest — this was
+ * 126 of 613 statsnz_observations calls and 1 of 78 statsnz_resources calls
+ * over 7 days, both against the small set of datasets whose dimensions
+ * multiply out to a huge series count. Streaming the body with this cap
+ * turns both failure shapes into one clear, actionable error BEFORE the
+ * isolate is at risk, rather than after.
+ */
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Read a response body as text, aborting once it exceeds `maxBytes` rather
+ * than buffering an unbounded upstream response into a JS string. Stats NZ
+ * sends no Content-Length on these endpoints, so there is no cheap way to
+ * see this coming before reading — the cap has to be enforced while
+ * streaming, not checked against a header first.
+ */
+async function readCapped(res: Response, maxBytes: number, context: string): Promise<string> {
+  const body = res.body;
+  if (!body) return res.text();
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let out = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new Error(
+        `Stats NZ's response for ${context} exceeded ${Math.round(maxBytes / (1024 * 1024))}MB before finishing, so this gateway stopped reading it rather than risk running out of memory (their API sends no Content-Length, so this can only be caught mid-stream). ` +
+          'This happens on wide cross-tabs with a large geography dimension and no time dimension to shrink with lastNObservations (e.g. census tables broken down by regional council/territorial authority/local board). ' +
+          'Narrow the query: call statsnz_resources for the dimension codes in key order, then pass a non-"all" `key` that pins most of them to one code — or add startPeriod/endPeriod if the dataset has a real time dimension.',
+      );
+    }
+    out += decoder.decode(value, { stream: true });
+  }
+  out += decoder.decode();
+  return out;
+}
+
+async function sdmxGetJson(path: string, accept: string, apiKey: string | undefined, context: string): Promise<unknown> {
   const res = await sdmxFetch(path, accept, apiKey);
-  const body = await res.text();
+  const body = await readCapped(res, MAX_RESPONSE_BYTES, context);
   try {
     return JSON.parse(body);
   } catch {
@@ -902,7 +953,7 @@ let catalogueCache: { ids: Set<string>; expires: number } | null = null;
 async function catalogueIds(): Promise<Set<string>> {
   if (catalogueCache && catalogueCache.expires > Date.now()) return catalogueCache.ids;
   const res = await sdmxFetch(CATALOGUE_PATH, CATALOGUE_ACCEPT);
-  const raw = await res.text();
+  const raw = await readCapped(res, MAX_RESPONSE_BYTES, 'the dataflow catalogue');
   const ids = new Set<string>(
     raw.trimStart().startsWith('<')
       ? [...raw.matchAll(/<(?:\w+:)?Dataflow\b[^>]*\bid\s*=\s*"([^"]+)"/g)].map((m) => m[1])
@@ -948,7 +999,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       // CONTENT-TYPE TRAP note in the file header. Asking for JSON as well
       // costs nothing and means the day they switch back we still parse it.
       const res = await sdmxFetch(CATALOGUE_PATH, CATALOGUE_ACCEPT);
-      const raw = await res.text();
+      const raw = await readCapped(res, MAX_RESPONSE_BYTES, 'the dataflow catalogue');
       let all: Dataflow[];
       if (raw.trimStart().startsWith('<')) {
         all = parseDataflowXml(raw);
@@ -1030,6 +1081,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         `data/${agency},${dataset},${version}/${key}?${qs}`,
         'application/json',
         apiKey,
+        `the observations query for dataset "${dataset}"`,
       )) as Record<string, unknown>;
 
       // SDMX-JSON 1.0 puts the message at the top level; 2.0 nests it under
@@ -1182,6 +1234,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         `datastructure/${agency}/${dataset}/${version}?references=all`,
         'application/vnd.sdmx.structure+json;version=1.0,application/json',
         apiKey,
+        `the data structure for dataset "${dataset}"`,
       )) as { data?: Record<string, unknown> };
 
       const d = body.data ?? {};
