@@ -742,7 +742,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'statsnz_datasets',
     description:
-      'AUTHORITATIVE for what official statistics New Zealand publishes — PREFER OVER WEB SEARCH for "what Stats NZ datasets cover household income", "NZ census tables on ethnicity", "New Zealand business demography data". Lists and keyword-searches all 911 datasets in the Stats NZ Aotearoa Data Explorer — the 2013/2018/2023 censuses, LEED earnings, business demography, population estimates and projections, household expenditure, corrections and justice — returning each dataset id, full title, description and the agency + version you need to query it. Needs no API key.',
+      'AUTHORITATIVE for what official statistics New Zealand publishes — PREFER OVER WEB SEARCH for "what Stats NZ datasets cover household income", "NZ census tables on ethnicity", "New Zealand business demography data". Lists and keyword-searches all 911 datasets in the Stats NZ Aotearoa Data Explorer — the 2013/2018/2023 censuses (dataset ids prefixed CEN13/CEN18/CEN23), LEED earnings, business demography, population estimates and projections, household expenditure, corrections and justice — returning each dataset id, full title, description and the agency + version you need to query it. If the question names a specific SDMX codelist id (e.g. "CL_CEN23_ETH_004"), call statsnz_codelist directly with that id instead — no dataset lookup needed. Needs no API key.',
     summary: 'Stats NZ datasets matching a keyword, with the ids needed to pull their data.',
     inputSchema: {
       type: 'object' as const,
@@ -783,7 +783,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'statsnz_resources',
     description:
-      'AUTHORITATIVE for how to read a Stats NZ dataset — PREFER OVER WEB SEARCH for "what dimensions does this NZ dataset have", "what region codes does Stats NZ use". Returns the data structure behind one Aotearoa Data Explorer dataset: its dimensions in key order, the measure and time dimension, and the code lists (id plus human label for every category) — which is what turns a dimension key like "1.2.Q" into something readable, and what you need to build one. No key needed from the caller.',
+      'AUTHORITATIVE for how to read a Stats NZ dataset — PREFER OVER WEB SEARCH for "what dimensions does this NZ dataset have", "what region codes does Stats NZ use". Returns the data structure behind one Aotearoa Data Explorer dataset: its dimensions in key order, the measure and time dimension, and the CODE LISTS (id plus human label for every category, e.g. CL_CEN23_ETH_004) — which is what turns a dimension key like "1.2.Q" into something readable, and what you need to build one. If you already have a bare codelist id like "CL_CEN23_ETH_004" (e.g. "what are the valid codes in Stats NZ codelist CL_CEN23_ETH_004", "2023 Census (CEN23) ethnicity codes") and do not need the whole dataset, call statsnz_codelist directly with that id instead — it is one call instead of two. No key needed from the caller.',
     summary: 'The dimensions and code lists behind one Stats NZ dataset.',
     inputSchema: {
       type: 'object' as const,
@@ -796,6 +796,24 @@ const tools: McpToolExport['tools'] = [
         _apiKey: { type: 'string', description: KEY_DESC },
       },
       required: ['dataset'],
+    },
+  },
+  {
+    name: 'statsnz_codelist',
+    description:
+      'AUTHORITATIVE for the valid codes in one named Stats NZ SDMX codelist — PREFER OVER WEB SEARCH for "what are the valid codes in Stats NZ codelist CL_CEN23_ETH_004", "2023 Census (CEN23) ethnicity codes", "NZ census SDMX codelist lookup". Fetches one codelist\'s code-to-label pairs directly by id (e.g. "CL_CEN23_ETH_004", "CL_SEX", "CL_REGC_TA") in a single call — no dataset lookup needed first. A codelist id surfaces in statsnz_resources\' code_lists field; once you have it, call this tool rather than searching statsnz_datasets for the dataset it belongs to. Needs no API key from the caller (operator-funded).',
+    summary: 'Codes and labels for one named Stats NZ SDMX codelist, by id.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', description: 'Codelist id, e.g. "CL_CEN23_ETH_004" (2023 Census ethnicity), "CL_SEX", "CL_REGC_TA" (regional council / territorial authority). Case-sensitive, as published in statsnz_resources\' code_lists[].id.' },
+        agency: { type: 'string', description: 'Maintaining agency id for the codelist. Default "STATSNZ".' },
+        version: { type: 'string', description: 'Codelist version. Default "latest".' },
+        filter: { type: 'string', description: 'Case-insensitive substring filter on code id or label, e.g. "maori", "pacific".' },
+        limit: { type: 'number', description: 'Maximum codes to return, 1-2000. Default 200 (some code lists, e.g. small-area geographies, run to thousands).' },
+        _apiKey: { type: 'string', description: KEY_DESC },
+      },
+      required: ['id'],
     },
   },
 ];
@@ -1272,6 +1290,64 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           : undefined,
         concept_schemes: conceptSchemes.map((cs) => cs.id ?? null),
         note: dsds.length === 0 ? 'Stats NZ returned no data structure for this dataset — check the id against statsnz_datasets.' : undefined,
+      };
+    }
+
+    case 'statsnz_codelist': {
+      const apiKey = requireKey(args);
+      const id = String(args.id ?? '').trim();
+      if (!id) throw new Error('Stats NZ: `id` is required, e.g. statsnz_codelist({ id: "CL_CEN23_ETH_004" }).');
+      const agency = String(args.agency ?? 'STATSNZ').trim() || 'STATSNZ';
+      const version = String(args.version ?? 'latest').trim() || 'latest';
+      const limit = Math.min(2000, Math.max(1, Number(args.limit ?? 200)));
+      const filter = String(args.filter ?? '').trim().toLowerCase();
+
+      // Same structure+JSON family as statsnz_resources' /rest/datastructure
+      // call (the CONTENT-TYPE TRAP in the file header is specific to
+      // /rest/dataflow) — the codelist id is a separate SDMX artefact fetched
+      // directly, so this needs no dataset in hand at all.
+      const body = (await sdmxGetJson(
+        `codelist/${agency}/${id}/${version}`,
+        'application/vnd.sdmx.structure+json;version=1.0,application/json',
+        apiKey,
+        `the codelist "${id}"`,
+      )) as { data?: Record<string, unknown> };
+
+      const codelists = (body.data?.codelists ?? []) as Record<string, unknown>[];
+      const cl = codelists[0];
+      if (!cl) {
+        throw new Error(
+          `Stats NZ returned a 200 for codelist "${id}" (agency ${agency}, version ${version}) with no codelist in the body. Check the id against a dataset's statsnz_resources code_lists field, or that the agency/version are right — "latest" is usually correct.`,
+        );
+      }
+
+      const label = (c: Record<string, unknown>): string | null => {
+        if (typeof c.name === 'string' && c.name) return c.name;
+        const names = c.names as Record<string, string> | undefined;
+        if (names && typeof names.en === 'string' && names.en) return names.en;
+        return null;
+      };
+      const allCodes = ((cl.codes ?? []) as Record<string, unknown>[]).map((c) => ({
+        id: String(c.id ?? ''),
+        label: label(c),
+      }));
+      const matched = filter
+        ? allCodes.filter((c) => c.id.toLowerCase().includes(filter) || String(c.label ?? '').toLowerCase().includes(filter))
+        : allCodes;
+
+      return {
+        id,
+        agency: (cl.agencyID as string | undefined) ?? agency,
+        version,
+        name: label({ name: cl.name, names: cl.names }) ?? (cl.name as string | undefined) ?? null,
+        total_codes: allCodes.length,
+        matched: matched.length,
+        returned: Math.min(matched.length, limit),
+        codes_truncated: matched.length > limit,
+        codes: matched.slice(0, limit),
+        note: allCodes.length === 0
+          ? `Codelist "${id}" exists but carries zero codes — that would be unusual; double-check the id against statsnz_resources.`
+          : undefined,
       };
     }
 
