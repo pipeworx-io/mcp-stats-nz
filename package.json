@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-stats-nz",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "New Zealand official statistics (Aotearoa Data Explorer) — search Stats NZ's 911 published datasets by keyword and pull their observations, covering the 2013/2018/2023 censuses, earnings, business demography, population projections, household expenditure and justice statistics.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-d53bca714769af33e08670be9a42236b0ef73b57e1cb9ddaf3318eaf7cb06619",
-    "sourceCommit": "0ce6905893fe8da0d285be2f05754a4200d67371"
+    "sourceHash": "v1-6872ea790b3a51c3cd778e2a49bbe7da4ab3801aed6e2c84a5563038f5c721ae",
+    "sourceCommit": "a03f96ed672b8c149593c64ecbf30280cabf084c"
   }
 }

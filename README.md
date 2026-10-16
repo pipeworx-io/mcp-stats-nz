@@ -5,13 +5,13 @@ New Zealand official statistics (Aotearoa Data Explorer) — search Stats NZ's
 2013/2018/2023 censuses, LEED earnings, business demography, population
 estimates and projections, household expenditure, corrections and justice.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1764+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1819+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `statsnz_datasets({ query, limit, offset })` — **keyless**. Keyword-search all
   911 datasets; returns dataset id, full title, description, agency, version.
-- `statsnz_observations({ dataset, key, agency, version, startPeriod, endPeriod, lastNObservations, _apiKey })` — period/value pairs with their dimension labels.
+- `statsnz_observations({ dataset, key, agency, version, startPeriod, endPeriod, lastNObservations, _apiKey })` — period/value pairs with their dimension labels. A too-wide unfiltered query is auto-narrowed to totals and flagged in `narrowed` (see Traps).
 - `statsnz_resources({ dataset, agency, version, includeCodes, maxCodesPerList, _apiKey })` — dimensions in key order, time dimension, measure, and the code lists that turn a key like `1.2.Q` into something readable.
 
 ## Auth
@@ -60,6 +60,20 @@ to the Aotearoa Data Explorer API product.
   `empty_reason` saying which case it is — no structure at all (routed but
   uninterpretable), a dimension `key` that filtered everything out, a period
   window with nothing in it, or a genuine upstream gap.
+- **An unfiltered query on a wide census table is too big to return, so the
+  pack narrows it and says so.** CEN23_HAD_020 with key `all` was ~208MB of
+  SDMX-JSON on 2026-10-16 (no Content-Length, no time dimension for
+  `lastNObservations` to shrink), past the pack's 16MB streaming cap; that was
+  24 of 44 external `statsnz_observations` calls in 48h. When the cap trips on
+  an unfiltered query, the pack reads the dataset structure, pins geography
+  dimensions (then the widest remaining ones, while the open cross product is
+  over 250k cells) to the ROOT code Stats NZ labels "Total …" — never a
+  "Total stated …" subtotal — re-queries, and returns the slice with
+  `requested_key: "all"` and a `narrowed` object listing each pin and how to ask
+  for the breakdown. CEN23_HAD_020 comes back as key `.9999....` (Total - New
+  Zealand by regional council), 16,920 rows. A caller-supplied `key` is never
+  narrowed; a too-wide one, or a dataset with no Total code to pin, fails as
+  `user_error` with the dimensions and sample codes inline.
 - **401 does not mean "bad credential" here.** Because an unmatched route also
   answers 401, a malformed path and a missing key are indistinguishable by
   status. The pack's 401 message says both possibilities out loud.
@@ -147,7 +161,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1764+ data sources. The
+Both URLs reach the same gateway and the same 1819+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

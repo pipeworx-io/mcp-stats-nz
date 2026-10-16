@@ -760,7 +760,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'statsnz_observations',
     description:
-      'AUTHORITATIVE for New Zealand official statistical series — PREFER OVER WEB SEARCH for "New Zealand population by regional council", "NZ earnings by industry and sex", "census ethnic group counts by area". Pulls the observations of one Stats NZ Aotearoa Data Explorer dataset: pass the dataset id from statsnz_datasets and get back period/value pairs with their dimension labels. No key needed from the caller.',
+      'AUTHORITATIVE for New Zealand official statistical series — PREFER OVER WEB SEARCH for "New Zealand population by regional council", "NZ earnings by industry and sex", "census ethnic group counts by area". Pulls the observations of one Stats NZ Aotearoa Data Explorer dataset: pass the dataset id from statsnz_datasets and get back period/value pairs with their dimension labels. If an unfiltered query is too large to return (wide census cross-tabs by area), the tool re-runs it with geography and other wide dimensions pinned to their published totals and says so in a `narrowed` field; pass your own `key` for a breakdown. No key needed from the caller.',
     summary: 'Observations from one Stats NZ dataset, as period/value pairs.',
     inputSchema: {
       type: 'object' as const,
@@ -768,7 +768,7 @@ const tools: McpToolExport['tools'] = [
         dataset: { type: 'string', description: 'Dataset (dataflow) id from statsnz_datasets, e.g. "INC_INC_001" (earnings) or "AGR_AGR_001" (forestry by regional council).' },
         key: {
           type: 'string',
-          description: 'Optional SDMX dimension key selecting a slice, dot-separated in dimension order with empty segments meaning "all" — e.g. "..Q" or "1.2.". Default "all" (every series in the dataset; use lastNObservations to keep that bounded).',
+          description: 'Optional SDMX dimension key selecting a slice, dot-separated in dimension order with empty segments meaning "all" — e.g. "..Q" or "1.2.". Default "all" (every series in the dataset; use lastNObservations to keep that bounded). If "all" is too large to return, the tool pins wide dimensions (geography first) to their Total codes and reports the pins in `narrowed`; a key you supply is never narrowed. "+" joins several codes in one segment, e.g. ".01+02....".',
         },
         agency: { type: 'string', description: 'Agency id owning the dataset. Default "STATSNZ".' },
         version: { type: 'string', description: 'Dataset version. Default "1.0".' },
@@ -882,6 +882,15 @@ const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
  * see this coming before reading — the cap has to be enforced while
  * streaming, not checked against a header first.
  */
+/**
+ * The cap tripping is a fact about the QUERY (too wide), not a defect, so it
+ * carries `user_error:` and a distinct class: statsnz_observations catches it
+ * to narrow an unfiltered query automatically (fleet #3156) instead of
+ * handing the caller a recipe most callers — an LLM router, mostly — never
+ * follow. Before the prefix this booked half `error`, half `user_error`.
+ */
+class ResponseTooLargeError extends Error {}
+
 async function readCapped(res: Response, maxBytes: number, context: string): Promise<string> {
   const body = res.body;
   if (!body) return res.text();
@@ -895,8 +904,8 @@ async function readCapped(res: Response, maxBytes: number, context: string): Pro
     total += value.byteLength;
     if (total > maxBytes) {
       await reader.cancel().catch(() => {});
-      throw new Error(
-        `Stats NZ's response for ${context} exceeded ${Math.round(maxBytes / (1024 * 1024))}MB before finishing, so this gateway stopped reading it rather than risk running out of memory (their API sends no Content-Length, so this can only be caught mid-stream). ` +
+      throw new ResponseTooLargeError(
+        `user_error: Stats NZ's response for ${context} exceeded ${Math.round(maxBytes / (1024 * 1024))}MB before finishing, so this gateway stopped reading it rather than risk running out of memory (their API sends no Content-Length, so this can only be caught mid-stream). ` +
           'This happens on wide cross-tabs with a large geography dimension and no time dimension to shrink with lastNObservations (e.g. census tables broken down by regional council/territorial authority/local board). ' +
           'Narrow the query: call statsnz_resources for the dimension codes in key order, then pass a non-"all" `key` that pins most of them to one code — or add startPeriod/endPeriod if the dataset has a real time dimension.',
       );
@@ -1010,6 +1019,309 @@ function parseDataflowXml(xml: string): Dataflow[] {
   return out;
 }
 
+/**
+ * Turn one SDMX-JSON data message into the tool's response shape. Split out of
+ * callTool so the auto-narrowing path (fleet #3156) shapes its re-query with
+ * exactly the same code as an ordinary call.
+ */
+function shapeObservations(
+  body: Record<string, unknown>,
+  ctx: { dataset: string; agency: string; version: string; key: string; startPeriod?: unknown; endPeriod?: unknown },
+): Record<string, unknown> & { count: number } {
+  const { dataset, agency, version, key } = ctx;
+  // SDMX-JSON 1.0 puts the message at the top level; 2.0 nests it under
+  // `data`. Accept either rather than betting on one.
+  const data = (body.data ?? body) as Record<string, unknown>;
+  const dataSets = (data.dataSets ?? []) as Record<string, unknown>[];
+  const structure = (data.structure ?? (Array.isArray(data.structures) ? (data.structures as Record<string, unknown>[])[0] : {}) ?? {}) as Record<string, unknown>;
+  const dims = (structure.dimensions ?? {}) as Record<string, unknown>;
+
+  const readDims = (group: unknown) =>
+    ((group ?? []) as Record<string, unknown>[])
+      .map((d) => ({
+        id: String(d.id ?? ''),
+        role: typeof d.role === 'string' ? d.role : undefined,
+        keyPosition: typeof d.keyPosition === 'number' ? d.keyPosition : undefined,
+        values: ((d.values ?? []) as Record<string, unknown>[]).map((v) => String(v.name ?? v.id ?? '')),
+      }))
+      .sort((a, b) => (a.keyPosition ?? 0) - (b.keyPosition ?? 0));
+
+  const datasetDims = readDims(dims.dataset);
+  const seriesDims = readDims(dims.series);
+  const obsDims = readDims(dims.observation);
+
+  // A dimension parked at dataset level is constant for every observation.
+  const constant: Record<string, string> = {};
+  for (const d of datasetDims) if (d.values.length === 1) constant[d.id] = d.values[0];
+
+  const label = (defs: { id: string; values: string[] }[], parts: string[]) => {
+    const out: Record<string, string> = {};
+    defs.forEach((d, i) => {
+      if (i >= parts.length) return;
+      const idx = Number(parts[i]);
+      out[d.id] = d.values[idx] ?? String(parts[i]);
+    });
+    return out;
+  };
+
+  const observations: Record<string, unknown>[] = [];
+  for (const ds of dataSets) {
+    const series = (ds.series ?? {}) as Record<string, Record<string, unknown>>;
+    // Layout A — series-keyed: series dims in the series key, the remaining
+    // dimension (usually time) in the nested observation index.
+    for (const [seriesKey, sv] of Object.entries(series)) {
+      const seriesLabels = label(seriesDims, seriesKey.split(':'));
+      const obs = (sv.observations ?? {}) as Record<string, unknown[]>;
+      for (const [oi, vals] of Object.entries(obs)) {
+        observations.push({
+          ...constant,
+          ...seriesLabels,
+          ...label(obsDims, oi.split(':')),
+          value: vals?.[0] ?? null,
+        });
+      }
+    }
+    // Layout B — flat: every dimension on the observation key, no `series`.
+    // This is what api.data.stats.govt.nz actually serves.
+    const flat = (ds.observations ?? {}) as Record<string, unknown[]>;
+    for (const [oKey, vals] of Object.entries(flat)) {
+      observations.push({ ...constant, ...label(obsDims, oKey.split(':')), value: vals?.[0] ?? null });
+    }
+  }
+
+  // The server may emit fewer key parts than there are declared dimensions
+  // (it drops a dimension it has collapsed to a single selection). Say which
+  // ones are therefore unlabelled rather than returning rows that quietly
+  // aggregate over a dimension the caller thinks they are seeing.
+  const keyParts = dataSets.flatMap((ds) => [
+    ...Object.keys((ds.observations ?? {}) as Record<string, unknown>),
+  ])[0]?.split(':').length;
+  const collapsed = keyParts != null && keyParts < obsDims.length ? obsDims.slice(keyParts) : [];
+  const unlabelled = collapsed.map((d) => d.id);
+
+  // How to get the dimension back depends on WHICH dimension it is, and
+  // getting that wrong is worse than saying nothing. startPeriod/endPeriod
+  // only bite on a declared time dimension; Stats NZ's DSDs mostly declare
+  // none (statsnz_resources reports time_dimension: [] for AGR_AGR_001, and
+  // the `role` field in the data message just echoes the dimension id), so
+  // the test here is the SDMX standard time id rather than a guess from the
+  // name. A dimension called YEAR_* is NOT a time dimension to this server.
+  //
+  // Shipped wrong once: the note told every caller to pass
+  // startPeriod/endPeriod, and INC_INC_001 collapses MEASURE_INC_INC_001 —
+  // a measure axis, where that advice cannot work (fleet #2244).
+  const isTimeDim = (d: { id: string; role?: string }) =>
+    d.id === 'TIME_PERIOD' || d.id.startsWith('TIME_PERIOD') || d.role === 'time';
+
+  const collapsedAdvice = (): string => {
+    const timeDims = collapsed.filter(isTimeDim);
+    if (timeDims.length === collapsed.length) {
+      return 'Pass startPeriod/endPeriod instead of lastNObservations if you need that dimension labelled.';
+    }
+    // Build a worked key: the right number of segments, the collapsed
+    // dimension's position filled in, everything else left open.
+    const example = obsDims
+      .map((d, i) => (collapsed.some((c) => c.id === d.id) ? `<${d.id}>` : ''))
+      .join('.');
+    const positions = collapsed
+      .map((d) => `${d.id} is segment ${obsDims.findIndex((o) => o.id === d.id) + 1} of ${obsDims.length}`)
+      .join('; ');
+    return (
+      `This is not a time dimension, so startPeriod/endPeriod will not bring it back. Pin it explicitly with the \`key\` argument instead: ${positions}, so pass key "${example}" with the placeholder replaced by a code id from statsnz_resources (empty segments mean "all").` +
+      (timeDims.length ? ' (A time dimension was also collapsed; startPeriod/endPeriod covers that one.)' : '')
+    );
+  };
+
+  // A zero here must never ship as a bare empty array. The upstream cannot
+  // tell us why (unmatched path, unknown dataset and genuinely-no-rows all
+  // arrive as 401 or as a clean 200), so ask the keyless catalogue, which
+  // is authoritative about what exists, and say which case this is.
+  // The id is already known to exist (checked above), so an empty result
+  // here is about the query or the upstream, and we can say which.
+  let emptyReason: string | undefined;
+  if (observations.length === 0) {
+    emptyReason = structure.dimensions == null
+      ? `Dataset "${dataset}" exists, but Stats NZ returned a response carrying no structure at all — that is the signature of a request their API routed but could not interpret, not of a dataset with no data.`
+      : key !== 'all'
+        ? `Dataset "${dataset}" exists and returned its structure, but no observation matched the dimension key "${key}". Call statsnz_resources to see the dimensions in key order — a key with the wrong number of segments filters everything out without erroring.`
+        : (ctx.startPeriod || ctx.endPeriod)
+          ? `Dataset "${dataset}" exists and returned its structure, but has no observation inside the requested period window. Drop startPeriod/endPeriod, or widen it.`
+          : `Dataset "${dataset}" exists and returned its structure, but Stats NZ published no observation for it. This is an upstream gap, not a malformed request.`;
+  }
+
+  return {
+    dataset, agency, version, key,
+    title: structure.name ?? null,
+    count: observations.length,
+    dimensions: [...datasetDims, ...seriesDims, ...obsDims].map((d) => d.id),
+    constant_dimensions: Object.keys(constant).length ? constant : undefined,
+    collapsed_dimensions: unlabelled.length ? unlabelled : undefined,
+    collapsed_note: unlabelled.length
+      ? `Stats NZ collapsed ${unlabelled.join(', ')} to a single selection (a side effect of lastNObservations) and omitted it from the observation key, so the returned rows do not say which one. ${collapsedAdvice()}`
+      : undefined,
+    observations,
+    empty_reason: emptyReason,
+  };
+}
+
+/**
+ * AUTO-NARROWING (fleet #3156). Measured 2026-10-16: statsnz_observations
+ * failed 24 of 44 external calls in 48h, nearly all `dataset=CEN23_HAD_020`
+ * with no key — whose unfiltered response is now ~208MB, far past the cap. The
+ * cap's error told callers how to narrow, and they (mostly an LLM router) did
+ * not. So when an UNFILTERED query trips the cap, the pack narrows it itself:
+ * it reads the dataset's structure (~64KB), pins wide dimensions to their
+ * published TOTAL code — geography first ("Total - New Zealand by regional
+ * council"), then the largest remaining code lists while the open-dimension
+ * cross product is still above CELL_BUDGET — re-queries, and returns the slice
+ * with a `narrowed` object naming every pin. Rows are therefore national totals
+ * across each pinned dimension, never a silently-dropped breakdown.
+ *
+ * Detection is the cap tripping rather than a cardinality pre-check: the
+ * product of code-list sizes overstates a sparse census cube by orders of
+ * magnitude, so a pre-check would narrow datasets that answer fine today. The
+ * trip costs one 16MB read; `narrowCache` remembers the dataset so later calls
+ * in the isolate skip straight to the structure fetch.
+ *
+ * A caller-supplied `key` is never touched.
+ */
+const CELL_BUDGET = 250_000;
+const NARROW_TTL_MS = 30 * 60 * 1000;
+const narrowCache = new Map<string, { expires: number }>();
+
+interface SdmxCode { id: string; label: string; parent?: string }
+interface DimInfo { id: string; position: number; codelist: string | null; codes: SdmxCode[] }
+
+async function loadDims(agency: string, dataset: string, version: string, apiKey: string): Promise<DimInfo[]> {
+  // references=children carries the code lists (~64KB for CEN23_HAD_020);
+  // references=codelist is a 401 on this gateway (unmatched route).
+  const body = (await sdmxGetJson(
+    `datastructure/${agency}/${dataset}/${version}?references=children`,
+    'application/vnd.sdmx.structure+json;version=1.0,application/json',
+    apiKey,
+    `the data structure for dataset "${dataset}"`,
+  )) as { data?: Record<string, unknown> };
+  const d = body.data ?? {};
+  const dsd = (((d.dataStructures ?? []) as Record<string, unknown>[])[0] ?? {}) as Record<string, unknown>;
+  const comps = (dsd.dataStructureComponents ?? {}) as Record<string, unknown>;
+  const dimList = (((comps.dimensionList ?? {}) as Record<string, unknown>).dimensions ?? []) as Record<string, unknown>[];
+  const lists = new Map<string, SdmxCode[]>();
+  for (const cl of (d.codelists ?? []) as Record<string, unknown>[]) {
+    lists.set(String(cl.id ?? ''), ((cl.codes ?? []) as Record<string, unknown>[]).map((c) => ({
+      id: String(c.id ?? ''),
+      label: typeof c.name === 'string' ? c.name : String((c.names as Record<string, string> | undefined)?.en ?? c.id ?? ''),
+      parent: typeof c.parent === 'string' ? c.parent : undefined,
+    })));
+  }
+  return dimList.map((dim, i) => {
+    const urn = String((dim.localRepresentation as Record<string, unknown> | undefined)?.enumeration ?? '');
+    const codelist = urn.match(/Codelist=[^:]+:([^(]+)\(/)?.[1] ?? null;
+    return { id: String(dim.id ?? ''), position: i + 1, codelist, codes: (codelist && lists.get(codelist)) || [] };
+  });
+}
+
+/**
+ * The codes in a list that stand for "everything in this dimension". Only
+ * ROOT codes (no parent) qualify, and only by what Stats NZ itself labels them
+ * — "Total - age", "Total people - ethnicity", "Total - New Zealand by regional
+ * council" — or the SDMX standard `_T`. "Total stated - …" is a subtotal that
+ * excludes non-response, so it is never used as the total.
+ */
+function totalCodes(codes: SdmxCode[]): SdmxCode[] {
+  return codes.filter(
+    (c) => !c.parent && (c.id === '_T' || (/^(total\b|new zealand( total)?$)/i.test(c.label.trim()) && !/\bstated\b/i.test(c.label))),
+  );
+}
+
+const isGeography = (d: DimInfo): boolean =>
+  /GEO|REGC|_TA_|TALB|DHB|SA[12]|WARD|AREA/i.test(`${d.id} ${d.codelist ?? ''}`) ||
+  totalCodes(d.codes).some((c) => /new zealand/i.test(c.label));
+
+function dimensionSamples(dims: DimInfo[]): string {
+  return dims
+    .map((d) => {
+      const sample = d.codes.slice(0, 3).map((c) => `${c.id}="${c.label}"`).join(', ');
+      return `${d.position}. ${d.id} (${d.codes.length} codes${sample ? `: ${sample}` : ''})`;
+    })
+    .join('; ');
+}
+
+async function narrowedObservations(p: {
+  dataset: string; agency: string; version: string; apiKey: string; cacheKey: string;
+  fetchObs: (k: string) => Promise<Record<string, unknown>>;
+  ctx: { dataset: string; agency: string; version: string; startPeriod?: unknown; endPeriod?: unknown };
+}): Promise<unknown> {
+  const dims = await loadDims(p.agency, p.dataset, p.version, p.apiKey);
+  const capMb = Math.round(MAX_RESPONSE_BYTES / (1024 * 1024));
+  const giveUp = (why: string): never => {
+    throw new Error(
+      `user_error: Stats NZ's unfiltered response for dataset "${p.dataset}" exceeds ${capMb}MB, and ${why} ` +
+        `Retry with a \`key\`: one dot-separated segment per dimension in this order, empty = all, "+" joins codes — ${dimensionSamples(dims)}. ` +
+        'statsnz_resources lists every code.',
+    );
+  };
+  if (dims.length === 0) giveUp('its data structure listed no dimensions to narrow by.');
+
+  const byWidth = (a: DimInfo, b: DimInfo) => b.codes.length - a.codes.length;
+  const pinnable = dims.filter((d) => totalCodes(d.codes).length > 0);
+  const order = [...pinnable.filter(isGeography).sort(byWidth), ...pinnable.filter((d) => !isGeography(d)).sort(byWidth)];
+  if (order.length === 0) giveUp('none of its dimensions publishes a "Total" code to pin automatically.');
+
+  // pins: dimension id -> index into that dimension's totalCodes()
+  const pins = new Map<string, number>();
+  const openCells = () => dims.filter((d) => !pins.has(d.id)).reduce((n, d) => n * Math.max(1, d.codes.length), 1);
+  let next = 0;
+  while (next < order.length && (isGeography(order[next]) || openCells() > CELL_BUDGET)) pins.set(order[next++].id, 0);
+  if (pins.size === 0) pins.set(order[next++].id, 0);
+
+  const buildKey = () =>
+    dims.map((d) => (pins.has(d.id) ? totalCodes(d.codes)[pins.get(d.id)!].id : '')).join('.');
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const key = buildKey();
+    let body: Record<string, unknown>;
+    try {
+      body = await p.fetchObs(key);
+    } catch (e) {
+      if (!(e instanceof ResponseTooLargeError)) throw e;
+      if (next >= order.length) giveUp(`is still over ${capMb}MB with every dimension that has a Total code pinned (key "${key}").`);
+      pins.set(order[next++].id, 0);
+      continue;
+    }
+    const result = shapeObservations(body, { ...p.ctx, key });
+    if (result.count === 0) {
+      // A code list can carry several totals (CL_CEN23_GEO_008 has one per
+      // geography hierarchy); the dataset may populate only some. Try the next.
+      const alt = [...pins].find(([id, i]) => i + 1 < totalCodes(dims.find((d) => d.id === id)!.codes).length);
+      if (alt) { pins.set(alt[0], alt[1] + 1); continue; }
+    }
+    narrowCache.set(p.cacheKey, { expires: Date.now() + NARROW_TTL_MS });
+    const pinned = dims.filter((d) => pins.has(d.id)).map((d) => {
+      const c = totalCodes(d.codes)[pins.get(d.id)!];
+      return { dimension: d.id, position: d.position, code: c.id, label: c.label };
+    });
+    const first = dims.find((d) => pins.has(d.id))!;
+    const breakdown = first.codes.filter((c) => c.parent).slice(0, 2).map((c) => c.id);
+    const example = dims
+      .map((d) => (d.id === first.id ? breakdown.join('+') : pins.has(d.id) ? totalCodes(d.codes)[pins.get(d.id)!].id : ''))
+      .join('.');
+    return {
+      ...result,
+      requested_key: 'all',
+      narrowed: {
+        is_slice: true,
+        why: `The unfiltered query (key "all") is larger than this gateway's ${capMb}MB response limit, so it was re-run as key "${key}". This is a SLICE: each pinned dimension below is fixed to its published total, so every row is a total ACROSS that dimension, not a breakdown by it.`,
+        pinned,
+        left_open: dims.filter((d) => !pins.has(d.id)).map((d) => d.id),
+        full_breakdown: `For a breakdown by a pinned dimension, pass your own \`key\` (segments in order: ${dims.map((d) => d.id).join('.')}; empty = all; "+" joins codes)` +
+          (breakdown.length ? ` — e.g. key "${example}" for ${first.id} codes ${breakdown.join(' and ')}.` : '.') +
+          ' statsnz_resources lists every code. A caller-supplied key is never narrowed.',
+      },
+    };
+  }
+  return giveUp('no automatic narrowing returned observations.');
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
     case 'statsnz_datasets': {
@@ -1095,146 +1407,29 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       // The commas in the flowRef and the dots in `key` are SDMX path syntax and
       // must reach the server literally — encodeURIComponent here is what made
       // this tool answer 200-with-zero-rows. See PATH TRAP 2 in the header.
-      const body = (await sdmxGetJson(
-        `data/${agency},${dataset},${version}/${key}?${qs}`,
-        'application/json',
-        apiKey,
-        `the observations query for dataset "${dataset}"`,
-      )) as Record<string, unknown>;
+      const fetchObs = async (k: string) =>
+        (await sdmxGetJson(
+          `data/${agency},${dataset},${version}/${k}?${qs}`,
+          'application/json',
+          apiKey,
+          `the observations query for dataset "${dataset}"`,
+        )) as Record<string, unknown>;
+      const ctx = { dataset, agency, version, startPeriod: args.startPeriod, endPeriod: args.endPeriod };
 
-      // SDMX-JSON 1.0 puts the message at the top level; 2.0 nests it under
-      // `data`. Accept either rather than betting on one.
-      const data = (body.data ?? body) as Record<string, unknown>;
-      const dataSets = (data.dataSets ?? []) as Record<string, unknown>[];
-      const structure = (data.structure ?? (Array.isArray(data.structures) ? (data.structures as Record<string, unknown>[])[0] : {}) ?? {}) as Record<string, unknown>;
-      const dims = (structure.dimensions ?? {}) as Record<string, unknown>;
+      // A caller-supplied key is never second-guessed: if it is still too wide,
+      // the cap's own user_error (with its narrowing recipe) goes back as-is.
+      if (key !== 'all') return shapeObservations(await fetchObs(key), { ...ctx, key });
 
-      const readDims = (group: unknown) =>
-        ((group ?? []) as Record<string, unknown>[])
-          .map((d) => ({
-            id: String(d.id ?? ''),
-            role: typeof d.role === 'string' ? d.role : undefined,
-            keyPosition: typeof d.keyPosition === 'number' ? d.keyPosition : undefined,
-            values: ((d.values ?? []) as Record<string, unknown>[]).map((v) => String(v.name ?? v.id ?? '')),
-          }))
-          .sort((a, b) => (a.keyPosition ?? 0) - (b.keyPosition ?? 0));
-
-      const datasetDims = readDims(dims.dataset);
-      const seriesDims = readDims(dims.series);
-      const obsDims = readDims(dims.observation);
-
-      // A dimension parked at dataset level is constant for every observation.
-      const constant: Record<string, string> = {};
-      for (const d of datasetDims) if (d.values.length === 1) constant[d.id] = d.values[0];
-
-      const label = (defs: { id: string; values: string[] }[], parts: string[]) => {
-        const out: Record<string, string> = {};
-        defs.forEach((d, i) => {
-          if (i >= parts.length) return;
-          const idx = Number(parts[i]);
-          out[d.id] = d.values[idx] ?? String(parts[i]);
-        });
-        return out;
-      };
-
-      const observations: Record<string, unknown>[] = [];
-      for (const ds of dataSets) {
-        const series = (ds.series ?? {}) as Record<string, Record<string, unknown>>;
-        // Layout A — series-keyed: series dims in the series key, the remaining
-        // dimension (usually time) in the nested observation index.
-        for (const [seriesKey, sv] of Object.entries(series)) {
-          const seriesLabels = label(seriesDims, seriesKey.split(':'));
-          const obs = (sv.observations ?? {}) as Record<string, unknown[]>;
-          for (const [oi, vals] of Object.entries(obs)) {
-            observations.push({
-              ...constant,
-              ...seriesLabels,
-              ...label(obsDims, oi.split(':')),
-              value: vals?.[0] ?? null,
-            });
-          }
-        }
-        // Layout B — flat: every dimension on the observation key, no `series`.
-        // This is what api.data.stats.govt.nz actually serves.
-        const flat = (ds.observations ?? {}) as Record<string, unknown[]>;
-        for (const [oKey, vals] of Object.entries(flat)) {
-          observations.push({ ...constant, ...label(obsDims, oKey.split(':')), value: vals?.[0] ?? null });
+      const cacheKey = `${agency},${dataset},${version}`;
+      const remembered = narrowCache.get(cacheKey);
+      if (!remembered || remembered.expires <= Date.now()) {
+        try {
+          return shapeObservations(await fetchObs('all'), { ...ctx, key });
+        } catch (e) {
+          if (!(e instanceof ResponseTooLargeError)) throw e;
         }
       }
-
-      // The server may emit fewer key parts than there are declared dimensions
-      // (it drops a dimension it has collapsed to a single selection). Say which
-      // ones are therefore unlabelled rather than returning rows that quietly
-      // aggregate over a dimension the caller thinks they are seeing.
-      const keyParts = dataSets.flatMap((ds) => [
-        ...Object.keys((ds.observations ?? {}) as Record<string, unknown>),
-      ])[0]?.split(':').length;
-      const collapsed = keyParts != null && keyParts < obsDims.length ? obsDims.slice(keyParts) : [];
-      const unlabelled = collapsed.map((d) => d.id);
-
-      // How to get the dimension back depends on WHICH dimension it is, and
-      // getting that wrong is worse than saying nothing. startPeriod/endPeriod
-      // only bite on a declared time dimension; Stats NZ's DSDs mostly declare
-      // none (statsnz_resources reports time_dimension: [] for AGR_AGR_001, and
-      // the `role` field in the data message just echoes the dimension id), so
-      // the test here is the SDMX standard time id rather than a guess from the
-      // name. A dimension called YEAR_* is NOT a time dimension to this server.
-      //
-      // Shipped wrong once: the note told every caller to pass
-      // startPeriod/endPeriod, and INC_INC_001 collapses MEASURE_INC_INC_001 —
-      // a measure axis, where that advice cannot work (fleet #2244).
-      const isTimeDim = (d: { id: string; role?: string }) =>
-        d.id === 'TIME_PERIOD' || d.id.startsWith('TIME_PERIOD') || d.role === 'time';
-
-      const collapsedAdvice = (): string => {
-        const timeDims = collapsed.filter(isTimeDim);
-        if (timeDims.length === collapsed.length) {
-          return 'Pass startPeriod/endPeriod instead of lastNObservations if you need that dimension labelled.';
-        }
-        // Build a worked key: the right number of segments, the collapsed
-        // dimension's position filled in, everything else left open.
-        const example = obsDims
-          .map((d, i) => (collapsed.some((c) => c.id === d.id) ? `<${d.id}>` : ''))
-          .join('.');
-        const positions = collapsed
-          .map((d) => `${d.id} is segment ${obsDims.findIndex((o) => o.id === d.id) + 1} of ${obsDims.length}`)
-          .join('; ');
-        return (
-          `This is not a time dimension, so startPeriod/endPeriod will not bring it back. Pin it explicitly with the \`key\` argument instead: ${positions}, so pass key "${example}" with the placeholder replaced by a code id from statsnz_resources (empty segments mean "all").` +
-          (timeDims.length ? ' (A time dimension was also collapsed; startPeriod/endPeriod covers that one.)' : '')
-        );
-      };
-
-      // A zero here must never ship as a bare empty array. The upstream cannot
-      // tell us why (unmatched path, unknown dataset and genuinely-no-rows all
-      // arrive as 401 or as a clean 200), so ask the keyless catalogue, which
-      // is authoritative about what exists, and say which case this is.
-      // The id is already known to exist (checked above), so an empty result
-      // here is about the query or the upstream, and we can say which.
-      let emptyReason: string | undefined;
-      if (observations.length === 0) {
-        emptyReason = structure.dimensions == null
-          ? `Dataset "${dataset}" exists, but Stats NZ returned a response carrying no structure at all — that is the signature of a request their API routed but could not interpret, not of a dataset with no data.`
-          : key !== 'all'
-            ? `Dataset "${dataset}" exists and returned its structure, but no observation matched the dimension key "${key}". Call statsnz_resources to see the dimensions in key order — a key with the wrong number of segments filters everything out without erroring.`
-            : (args.startPeriod || args.endPeriod)
-              ? `Dataset "${dataset}" exists and returned its structure, but has no observation inside the requested period window. Drop startPeriod/endPeriod, or widen it.`
-              : `Dataset "${dataset}" exists and returned its structure, but Stats NZ published no observation for it. This is an upstream gap, not a malformed request.`;
-      }
-
-      return {
-        dataset, agency, version, key,
-        title: structure.name ?? null,
-        count: observations.length,
-        dimensions: [...datasetDims, ...seriesDims, ...obsDims].map((d) => d.id),
-        constant_dimensions: Object.keys(constant).length ? constant : undefined,
-        collapsed_dimensions: unlabelled.length ? unlabelled : undefined,
-        collapsed_note: unlabelled.length
-          ? `Stats NZ collapsed ${unlabelled.join(', ')} to a single selection (a side effect of lastNObservations) and omitted it from the observation key, so the returned rows do not say which one. ${collapsedAdvice()}`
-          : undefined,
-        observations,
-        empty_reason: emptyReason,
-      };
+      return narrowedObservations({ dataset, agency, version, apiKey, fetchObs, ctx, cacheKey });
     }
 
     case 'statsnz_resources': {
