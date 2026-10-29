@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-stats-nz",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "New Zealand official statistics (Aotearoa Data Explorer) — search Stats NZ's 911 published datasets by keyword and pull their observations, covering the 2013/2018/2023 censuses, earnings, business demography, population projections, household expenditure and justice statistics.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-stats-nz": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "stats-nz"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-stats-nz.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/stats-nz",
   "pipeworx": {
-    "sourceHash": "v1-6872ea790b3a51c3cd778e2a49bbe7da4ab3801aed6e2c84a5563038f5c721ae",
-    "sourceCommit": "a03f96ed672b8c149593c64ecbf30280cabf084c"
+    "mode": "gateway",
+    "slug": "stats-nz",
+    "gatewaySlug": "stats-nz",
+    "sourceHash": "v1-bacde34f1a3f50ec0f9a2d8fb44e8e7aee315ec437d495b1df31861e65122a98",
+    "sourceCommit": "f47d581679e1e887373df51ba623f891fbe4c464"
   }
 }

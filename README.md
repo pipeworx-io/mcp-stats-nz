@@ -5,12 +5,13 @@ New Zealand official statistics (Aotearoa Data Explorer) — search Stats NZ's
 2013/2018/2023 censuses, LEED earnings, business demography, population
 estimates and projections, household expenditure, corrections and justice.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1819+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1857+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `statsnz_datasets({ query, limit, offset })` — **keyless**. Keyword-search all
   911 datasets; returns dataset id, full title, description, agency, version.
+- `statsnz_smoking_by_region({ region?, year?, _apiKey })` — Census smoking status (regular smoker / ex-smoker / never smoked regularly) by regional council for 2006, 2013, 2018 and 2023, with counts and percentages of people whose status was stated. Census self-report, not the Ministry of Health NZ Health Survey.
 - `statsnz_observations({ dataset, key, agency, version, startPeriod, endPeriod, lastNObservations, _apiKey })` — period/value pairs with their dimension labels. A too-wide unfiltered query is auto-narrowed to totals and flagged in `narrowed` (see Traps).
 - `statsnz_resources({ dataset, agency, version, includeCodes, maxCodesPerList, _apiKey })` — dimensions in key order, time dimension, measure, and the code lists that turn a key like `1.2.Q` into something readable.
 
@@ -161,7 +162,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1819+ data sources. The
+Both URLs reach the same gateway and the same 1857+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
@@ -175,10 +176,12 @@ curl -X POST https://gateway.pipeworx.io/v1/tools/statsnz_datasets \
 
 No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/statsnz_datasets`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
 
-## Standalone (no gateway account)
+## Run it from npm
 
-This package also runs as a local stdio MCP server — no Pipeworx account, no
-gateway round-trip:
+`@pipeworx/mcp-stats-nz` is a local stdio bridge to the Pipeworx gateway: your MCP client
+starts it with `npx`, and it forwards every call to the same
+`https://gateway.pipeworx.io/stats-nz/mcp` endpoint shown above. It needs network access;
+there is no offline mode.
 
 ```json
 {
@@ -191,15 +194,18 @@ gateway round-trip:
 }
 ```
 
-Or run it directly to confirm it starts:
+Without a key it calls anonymously, capped at 50 calls a day. A free account
+raises that to 200 a day: get a key at https://pipeworx.io/signup and add
+`"env": { "PIPEWORX_API_KEY": "<your key>" }` to the server entry.
+The key is sent as a Bearer token, the same way a hosted connection sends it,
+so calls are metered and billed exactly as they are there.
 
-```bash
-npx -y @pipeworx/mcp-stats-nz
-```
+It lists **only** this pack's tools by default. Set `PIPEWORX_META_TOOLS=1` to
+also list `ask_pipeworx` and the other gateway-wide tools.
 
-It speaks MCP over stdin/stdout and answers `initialize`/`tools/list`/`tools/call`
-for **only** this pack's tools — none of the shared meta-tools the gateway
-connection above adds. Same source, same tools, no ask_pipeworx routing.
+Behind an HTTPS proxy: Node's built-in `fetch` does not read `HTTPS_PROXY` by
+default. Newer Node releases honour it when `NODE_USE_ENV_PROXY=1` is set; check
+your Node version's documentation.
 
 ## Using with ask_pipeworx
 
